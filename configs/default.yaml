@@ -1,0 +1,121 @@
+# TrickForTreat: posture pipeline feasibility config.
+# Every path and tunable used by scripts/01-05 lives here. Scripts should never hardcode these values.
+# Paths are relative to the repo root.
+
+seed: 42                          # used for python `random`, numpy, torch, CUDA, and sklearn splitters
+
+paths:
+  data_root: data
+  raw_dir: data/raw               # 01 writes data/raw/<original_label>/<image_id>.jpg
+  raw_manifest: data/raw/manifest.csv
+  filtered_manifest: data/filtered_manifest.csv
+  classes_json: data/classes.json
+  dedup_log: data/duplicates_dropped.csv
+  split_manifest: data/split_manifest.csv      # deduped manifest plus a `split` column (trainval|test)
+  test_ids: data/test_ids.txt
+  crops_dir: data/crops           # 04 writes data/crops/<label>/<image_id>.jpg
+  crops_manifest: data/crops_manifest.csv
+  crop_drops_log: data/crop_drops.csv          # images 04 did not crop (no dog, multi-dog, too small, ...)
+  checkpoints_dir: checkpoints
+  results_dir: results
+  metrics_json: results/metrics.json
+  hf_cache_dir: data/hf_cache     # passed to datasets.load_dataset(cache_dir=...)
+
+dataset:
+  hf_repo: stockeh/dog-pose-cv    # not pinned to a revision (reproducibility not required for the prototype)
+  label_column: null              # null = auto-detect the single ClassLabel feature; set explicitly if ambiguous
+  image_column: null              # null = auto-detect the single Image feature
+  jpeg_quality: 95
+
+labels:
+  # Keys are the EXACT strings printed by 01_download.py. VERIFY THEM before running 02.
+  # The values below are guesses from the paper/README and may not match the ClassLabel names.
+  mapping:
+    sitting: sit
+    lying down: down
+    standing: stand
+  dropped_original_labels: [undefined]   # always dropped in 02 (mostly close-up portraits)
+  target_classes: [sit, down]     # classes that can trigger a reward; used for reward-precision metrics
+
+dedup:
+  hash: phash                     # perceptual hash from the `imagehash` package
+  hash_size: 8                    # 8 -> 64-bit hash
+  max_hamming_distance: 4         # <= this many differing bits = near-duplicate. Tune by eyeballing the debug grid.
+  keep_policy: random             # keep one image per duplicate group at random (seeded), even across labels
+
+split:
+  test_fraction: 0.15             # stratified by label
+
+detector:
+  weights: yolov8n.pt             # yolov8n.pt | yolov8s.pt | yolo11n.pt | yolo11s.pt (choose one, keep fixed)
+  dog_class_id: 16                # COCO "dog"
+  conf_threshold: 0.25            # minimum box confidence to count as a detection
+  iou_threshold: 0.45             # NMS IoU
+  imgsz: 640
+  device: auto                    # auto | cpu | cuda | mps
+  batch_size: 16
+  # Images with no dog box >= conf_threshold are skipped and logged (no full-image fallback).
+  # Images with more than one dog box >= conf_threshold are dropped and logged.
+
+crop:
+  pad_fraction: 0.10              # pad each side of the box by this fraction of box width/height
+  square: true                    # expand the shorter side so the crop is square, centered on the box
+  fill_rgb: [114, 114, 114]       # gray used where the square extends past the image edge
+  min_box_side_px: 32             # drop if the dog box (before padding) is smaller than this on either side
+
+classifier:
+  backbone: mobilenetv3_large_100   # timm name; alternatives: mobilenetv3_small_100, efficientnet_b0
+  pretrained: true
+  input_size: 224                 # crops are already square, so eval just resizes to 224x224 (no center crop)
+  normalize_mean: [0.485, 0.456, 0.406]
+  normalize_std: [0.229, 0.224, 0.225]
+  dropout: 0.2
+  freeze_backbone_epochs: 1       # train head only for N epochs, then unfreeze everything
+
+train:
+  k_folds: 5
+  epochs: 20
+  batch_size: 64
+  num_workers: 4
+  optimizer: adamw
+  lr_head: 1.0e-3
+  lr_backbone: 1.0e-4
+  weight_decay: 1.0e-4
+  scheduler: cosine
+  warmup_epochs: 1
+  label_smoothing: 0.0
+  early_stopping_patience: 5
+  selection_metric: macro_f1      # per-epoch checkpoint selection within each fold
+  amp: true                       # mixed precision on CUDA only
+  # No class weighting and no weighted sampler. Precision is controlled by the reward threshold (eval.*).
+  # Final model = retrain on all trainval for round(mean best epoch over folds) + 1 epochs.
+
+eval:
+  reward_precision_target: 0.85   # pick the lowest threshold per target class that reaches this precision
+  max_sit_down_confusion: 0.10    # feasibility bar: fraction of true sit predicted down, and vice versa
+  threshold_sweep: {start: 0.30, stop: 0.99, step: 0.01}
+  latency_warmup_iters: 10
+  latency_timed_iters: 200
+  latency_devices: [cpu]          # add cuda/mps if present; CPU is the conservative number
+
+augment:
+  random_resized_crop_scale: [0.80, 1.00]
+  random_resized_crop_ratio: [0.90, 1.11]   # near-square: crops are already square
+  hflip_p: 0.5
+  color_jitter:
+    brightness: 0.4               # window light: large brightness swings
+    contrast: 0.3
+    saturation: 0.3
+    hue: 0.03
+  color_jitter_p: 0.8
+  gaussian_blur_p: 0.2
+  gaussian_blur_kernel: 5
+  gaussian_blur_sigma: [0.1, 2.0]
+  grayscale_p: 0.05               # crude stand-in for low-light frames
+  jpeg_compression_p: 0.0         # TODO: consider >0 to mimic ESP32 MJPEG artifacts
+
+debug:
+  limit_images: null              # int = only process the first N images in every script (smoke test)
+  save_debug_grid: true           # write contact sheets of samples / crops / errors to results/debug/
+  debug_dir: results/debug
+  log_level: INFO
