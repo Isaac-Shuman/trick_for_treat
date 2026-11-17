@@ -1,342 +1,491 @@
+#!/usr/bin/env python3
 """
-05_train_classifier.py  (PSEUDOCODE, not runnable yet)
+05_train_classifier.py
 
-Purpose
--------
-Fine-tune a small pretrained classifier (MobileNetV3 or EfficientNet-B0 via timm) on the dog
-crops to predict sit / down / stand. Uses stratified K-fold CV on the trainval split to choose
-the epoch count and the reward thresholds, retrains on all of trainval, then evaluates ONCE on
-the held-out test split.
+Fine-tune a pretrained timm classifier (default MobileNetV3-Large) on the dog crops to predict
+sit / down / stand.
 
-The metric we care about most is PRECISION ON THE REWARD DECISION: when the model says "sit"
-(and the command was sit), how often is the dog actually sitting? A wrongly given treat is worse
-than a missed one.
+  1. Stratified K-fold CV on trainval. Each fold trains with early stopping on val macro F1 and
+     gives (a) its best epoch count and (b) out-of-fold (OOF) probabilities for its val images.
+  2. Reward thresholds from the pooled OOF predictions. Reward rule = argmax plus threshold:
+     reward commanded class t only if argmax == t and p(t) >= threshold[t]. threshold[t] is the
+     lowest value reaching eval.reward_precision_target. No class weighting anywhere.
+  3. Final model: retrain on ALL trainval for round(mean best epoch) + 1 epochs.
+  4. Save checkpoints/final.pt (model + classes + preprocessing + thresholds), reload it through
+     PostureClassifier (the runtime path), and evaluate ONCE on the held-out test crops.
+  5. Per-stage latency (crop -> prediction) at batch size 1 on CPU.
 
-Reward rule = ARGMAX PLUS THRESHOLD: reward for commanded class t only if
-    argmax(probs) == t  and  probs[t] >= threshold[t]
-threshold[t] is the lowest value that reaches eval.reward_precision_target (0.85) on pooled
-out-of-fold CV predictions. There is NO class weighting and NO weighted sampler: the model is
-trained with plain cross-entropy, and precision is controlled only by the threshold.
+Inputs:  data/crops_manifest.csv (04), data/classes.json (02), configs/default.yaml
+Outputs:
+  checkpoints/fold{k}_best.pt, checkpoints/final.pt
+  results/metrics.json                 everything for the writeup
+  results/train_log.csv                one row per (fold, epoch); updated live while training
+  results/pr_vs_threshold_{cv,test}.csv
+  results/test_predictions.csv         every test crop: true, predicted, probabilities
+  results/debug/05_*                   training curves, confusion matrices, reward curves,
+                                       augmented samples, confident mistakes, false rewards
 
-Model construction, preprocessing, and predict() live in trickforTreat/classifier.py, so the
-live pipeline will load the exact same model + transforms. This script owns training only.
-
-Inputs
-------
-- data/crops_manifest.csv  (from 04)
-- data/classes.json        (from 02; class order)
-- configs/default.yaml     (classifier.*, train.*, augment.*, eval.*)
-
-Outputs
--------
-- checkpoints/fold{k}_best.pt                     best epoch per fold (by train.selection_metric)
-- checkpoints/final.pt                            the model evaluated on test
-      contents: state_dict, classes, backbone, input_size, normalize stats, reward thresholds,
-                config snapshot, n_epochs used for the retrain
-- results/metrics.json                            see build_metrics_json()
-- results/confusion_fold{k}.png, results/confusion_test.png
-- results/pr_vs_threshold_cv.csv                  pooled out-of-fold curve; thresholds are chosen from this
-- results/pr_vs_threshold_test.csv                same curve on test (reported only, never used to choose)
-      columns: class, threshold, precision, recall, false_reward_rate, n_fired
-- results/train_log.csv                           fold, epoch, train_loss, val_loss, val metrics, lr
-
-Run
----
-    python scripts/05_train_classifier.py --config configs/default.yaml [--folds 0,1] [--limit N]
+Run:
+  python scripts/05_train_classifier.py                       # full run (CPU: a few hours)
+  python scripts/05_train_classifier.py --limit 400 --epochs 1 --folds 0,1   # smoke test, ~2 min
 """
 
-# import argparse, json, time, copy
-# import numpy as np, torch, torch.nn as nn
-# from torch.utils.data import Dataset, DataLoader
-# from sklearn.model_selection import StratifiedKFold
-# from sklearn.metrics import precision_recall_fscore_support, confusion_matrix
-# from trickforTreat.common import load_config, set_seed, read_csv, seed_worker
-# from trickforTreat.classifier import build_model, build_eval_transform, PostureClassifier
-# from trickforTreat.transforms import build_train_transform
+from __future__ import annotations
+
+import argparse
+import copy
+import math
+import random
+import sys
+import time
+from collections import Counter
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import numpy as np  # noqa: E402
+import torch  # noqa: E402
+import torch.nn.functional as F  # noqa: E402
+from PIL import Image  # noqa: E402
+from sklearn.model_selection import StratifiedKFold  # noqa: E402
+from torch.utils.data import DataLoader, Dataset  # noqa: E402
+from tqdm import tqdm  # noqa: E402
+
+from trickforTreat.classifier import (  # noqa: E402
+    PostureClassifier, backbone_parameters, build_model, head_parameters, set_backbone_trainable,
+)
+from trickforTreat.common import (  # noqa: E402
+    add_common_args, header, load_config, pick_device, print_table, read_csv, rel, resolve, save_contact_sheet,
+    save_json, seed_worker, set_seed, setup_logging, write_csv,
+)
+from trickforTreat.metrics import (  # noqa: E402
+    choose_threshold, classification_metrics, plot_confusion, plot_reward_curves, plot_training_curves, reward_curve,
+    row_at, threshold_grid,
+)
+from trickforTreat.transforms import build_eval_transform, build_train_transform, denormalize  # noqa: E402
+
+LOG_FIELDS = ["fold", "epoch", "frozen", "train_loss", "val_loss", "val_macro_f1", "val_accuracy",
+              "val_sit_as_down", "val_down_as_sit", "lr_head", "lr_backbone", "seconds"]
+CURVE_FIELDS = ["class", "threshold", "precision", "recall", "false_reward_rate", "n_fired"]
 
 
 # ---------------------------------------------------------------------------
 # Data
 # ---------------------------------------------------------------------------
 
-class CropDataset:  # (torch.utils.data.Dataset)
-    """
-    __init__(rows, transform): store rows (crop_path, label_id)
-    __len__: len(rows)
-    __getitem__(i): img = PIL.open(crop_path).convert("RGB"); return transform(img), label_id, image_id
-    """
+def load_cache(rows, size: int) -> np.ndarray:
+    """Every crop decoded once and resized to size x size (crops are square). ~1 GB for ~12k crops."""
+    arr = np.empty((len(rows), size, size, 3), dtype=np.uint8)
+    for i, r in enumerate(tqdm(rows, desc=f"cache crops @{size}px", unit="img")):
+        with Image.open(resolve(r["crop_path"])) as im:
+            arr[i] = np.asarray(im.convert("RGB").resize((size, size), Image.BILINEAR))
+    return arr
 
 
-def build_train_transform(cfg):
-    """
-    (Lives in trickforTreat/transforms.py; listed here for review.)
-    Compose([
-      RandomResizedCrop(input_size, scale=augment.random_resized_crop_scale,
-                        ratio=augment.random_resized_crop_ratio),      # light crop/scale jitter,
-                                                                       # mimics detector box jitter
-      RandomHorizontalFlip(p=augment.hflip_p),                         # posture is L/R symmetric
-                                                                       # NO vertical flip / big rotation:
-                                                                       # a flipped "down" isn't a real pose
-      RandomApply([ColorJitter(brightness, contrast, saturation, hue)], p=augment.color_jitter_p),
-                                                                       # window lighting changes
-      RandomGrayscale(p=augment.grayscale_p),
-      RandomApply([GaussianBlur(kernel, sigma)], p=augment.gaussian_blur_p),  # motion / ESP32 focus
-      # TODO optional: random JPEG compression (augment.jpeg_compression_p) for MJPEG artifacts
-      ToTensor(), Normalize(mean, std),
-    ])
-    Eval transform (in classifier.py): Resize((input_size, input_size)), ToTensor, Normalize.
-    Crops from 04 are already square with head and tail inside, so there is no center crop.
-    The RandomResizedCrop scale floor (0.80) is mild on purpose so it rarely cuts off the dog.
-    """
+class CropDataset(Dataset):
+    def __init__(self, indices, labels: np.ndarray, transform, cache: np.ndarray | None, paths: list[str]):
+        self.indices, self.labels, self.transform, self.cache, self.paths = list(indices), labels, transform, cache, paths
 
+    def __len__(self) -> int:
+        return len(self.indices)
 
-def make_loaders(train_rows, val_rows, cfg, classes):
-    """
-    train_ds = CropDataset(train_rows, build_train_transform(cfg))
-    val_ds   = CropDataset(val_rows,   build_eval_transform(cfg))
-    counts = bincount(label_ids of train_rows, minlength=len(classes))     # logged only
-    train_loader = DataLoader(train_ds, shuffle=True, generator=seeded, worker_init_fn=seed_worker)
-    val_loader = DataLoader(val_ds, shuffle=False, ...)    # val_rows may be None for the final retrain
-    return train_loader, val_loader, counts
-    """
-
-
-def make_criterion(cfg):
-    """
-    return CrossEntropyLoss(label_smoothing=cfg.train.label_smoothing)    # unweighted, by design
-    """
+    def __getitem__(self, k: int):
+        i = self.indices[k]
+        if self.cache is not None:
+            img = Image.fromarray(self.cache[i])
+        else:
+            with Image.open(resolve(self.paths[i])) as im:
+                img = im.convert("RGB")
+        return self.transform(img), int(self.labels[i])
 
 
 # ---------------------------------------------------------------------------
 # Training
 # ---------------------------------------------------------------------------
 
-def train_one_epoch(model, loader, criterion, optimizer, scheduler, scaler, device) -> float:
-    """
-    model.train(); for x, y, _ in loader: forward (autocast if amp), loss, backward, step,
-    scheduler.step() if per-iteration. Return mean loss.
-    assert not torch.isnan(loss), "NaN loss: check lr, AMP, or a corrupt image"
-    """
+@torch.no_grad()
+def predict_logits(model, loader, device) -> tuple[torch.Tensor, torch.Tensor]:
+    model.eval()
+    out, ys = [], []
+    for x, y in loader:
+        out.append(model(x.to(device)).float().cpu())
+        ys.append(y)
+    return torch.cat(out), torch.cat(ys)
 
 
-@torch_no_grad
-def predict_all(model, loader, device) -> tuple["np.ndarray", "np.ndarray", list[str]]:
-    """Returns probs [N, C] (softmax), y_true [N], image_ids. model.eval()."""
+def train_model(cfg, classes, data, train_idx, val_idx, device, epochs: int, tag: str, log_rows: list,
+                log) -> dict:
+    """Train one model. With val_idx: early stopping on val macro F1, best weights restored.
+    Returns {"model", "best_epoch", "val_probs", "val_y"}."""
+    tc, cc = cfg.train, cfg.classifier
+    set_seed(cfg.seed + (int(tag) if str(tag).isdigit() else 1000))
+    model = build_model(cc.backbone, len(classes), bool(cc.pretrained), float(cc.dropout)).to(device)
+    mean, std, size = cc.normalize_mean, cc.normalize_std, int(cc.input_size)
+    train_tf = build_train_transform(cfg.augment, size, mean, std)
+    eval_tf = build_eval_transform(size, mean, std)
+
+    g = torch.Generator().manual_seed(cfg.seed)
+    nw = int(tc.num_workers)
+    train_loader = DataLoader(CropDataset(train_idx, data["labels"], train_tf, data["cache"], data["paths"]),
+                              batch_size=int(tc.batch_size), shuffle=True, drop_last=len(train_idx) > int(tc.batch_size),
+                              num_workers=nw, worker_init_fn=seed_worker, generator=g, persistent_workers=nw > 0)
+    val_loader = None
+    if val_idx is not None:
+        val_loader = DataLoader(CropDataset(val_idx, data["labels"], eval_tf, data["cache"], data["paths"]),
+                                batch_size=128, shuffle=False, num_workers=nw, persistent_workers=nw > 0)
+
+    opt = torch.optim.AdamW([{"params": head_parameters(model), "lr": float(tc.lr_head)},
+                             {"params": backbone_parameters(model), "lr": float(tc.lr_backbone)}],
+                            weight_decay=float(tc.weight_decay))
+    steps = len(train_loader)
+    total, warm = epochs * steps, max(1, int(float(tc.warmup_epochs) * steps))
+    sched = torch.optim.lr_scheduler.LambdaLR(
+        opt, lambda s: (s + 1) / warm if s < warm else 0.5 * (1 + math.cos(math.pi * (s - warm) / max(1, total - warm))))
+    freeze = int(cc.freeze_backbone_epochs)
+
+    best = {"score": -1.0, "epoch": -1, "state": None, "probs": None, "y": None}
+    patience = 0
+    for epoch in range(epochs):
+        t0 = time.perf_counter()
+        frozen = epoch < freeze
+        set_backbone_trainable(model, not frozen)
+        model.train()
+        losses = []
+        for x, y in tqdm(train_loader, desc=f"[{tag}] epoch {epoch + 1}/{epochs}{' (head only)' if frozen else ''}",
+                         leave=False, unit="batch"):
+            loss = F.cross_entropy(model(x.to(device)), y.to(device), label_smoothing=float(tc.label_smoothing))
+            assert torch.isfinite(loss), "non-finite loss: check the learning rate or a corrupt image"
+            opt.zero_grad(set_to_none=True)
+            loss.backward()
+            opt.step()
+            sched.step()
+            losses.append(loss.item())
+        row = {"fold": tag, "epoch": epoch + 1, "frozen": frozen, "train_loss": round(float(np.mean(losses)), 4),
+               "val_loss": None, "val_macro_f1": None, "val_accuracy": None, "val_sit_as_down": None,
+               "val_down_as_sit": None, "lr_head": opt.param_groups[0]["lr"], "lr_backbone": opt.param_groups[1]["lr"]}
+        msg = f"[{tag}] epoch {epoch + 1:2d}/{epochs}  train_loss {row['train_loss']:.4f}"
+        if val_loader is not None:
+            logits, yv = predict_logits(model, val_loader, device)
+            probs = torch.softmax(logits, 1).numpy()
+            m = classification_metrics(probs, yv.numpy(), classes)
+            row.update(val_loss=round(F.cross_entropy(logits, yv).item(), 4), val_macro_f1=round(m["macro_f1"], 4),
+                       val_accuracy=round(m["accuracy"], 4), val_sit_as_down=round(m.get("sit_as_down", 0), 4),
+                       val_down_as_sit=round(m.get("down_as_sit", 0), 4))
+            msg += (f"  val_loss {row['val_loss']:.4f}  macro_f1 {m['macro_f1']:.4f}  acc {m['accuracy']:.4f}"
+                    f"  sit->down {m.get('sit_as_down', 0):.3f}  down->sit {m.get('down_as_sit', 0):.3f}")
+            if m["macro_f1"] > best["score"]:
+                best.update(score=m["macro_f1"], epoch=epoch + 1, state=copy.deepcopy(model.state_dict()),
+                            probs=probs, y=yv.numpy())
+                patience = 0
+                msg += "  *best*"
+            else:
+                patience += 1
+        row["seconds"] = round(time.perf_counter() - t0, 1)
+        log_rows.append(row)
+        write_csv(log_rows, cfg.paths.results_dir + "/train_log.csv", LOG_FIELDS)
+        log.info("%s  (%.0fs)", msg, row["seconds"])
+        if val_loader is not None and patience >= int(tc.early_stopping_patience):
+            log.info("[%s] early stop: no val improvement for %d epochs", tag, patience)
+            break
+    if val_loader is not None:
+        model.load_state_dict(best["state"])
+    return {"model": model.eval(), "best_epoch": best["epoch"] if val_loader is not None else epochs,
+            "val_probs": best["probs"], "val_y": best["y"]}
 
 
-def compute_metrics(probs, y_true, classes, target_classes) -> dict:
-    """
-    Plain argmax classification metrics (used per epoch for checkpoint selection):
-    y_pred = probs.argmax(1)
-    p, r, f1, support = precision_recall_fscore_support(y_true, y_pred, labels=range(C), zero_division=0)
-    cm = confusion_matrix(y_true, y_pred, labels=range(C))
-    out = {"per_class": {c: {"precision", "recall", "f1", "support"}}, "macro_f1", "accuracy",
-           "confusion_matrix": cm.tolist(),
-           "sit_as_down": cm[sit, down] / cm[sit].sum(), "down_as_sit": cm[down, sit] / cm[down].sum()}
+def make_classifier(model, cfg, classes, thresholds=None, device="cpu") -> PostureClassifier:
+    cc = cfg.classifier
+    return PostureClassifier(model, classes, cc.backbone, int(cc.input_size), cc.normalize_mean, cc.normalize_std,
+                             thresholds, device)
+
+
+# ---------------------------------------------------------------------------
+# Latency
+# ---------------------------------------------------------------------------
+
+def measure_latency(clf: PostureClassifier, crops: list[Image.Image], cfg) -> dict:
+    for c in crops[: int(cfg.eval.latency_warmup_iters)]:
+        clf.predict(c)
+    stages = {"pre": [], "fwd": [], "post": []}
+    for i in range(int(cfg.eval.latency_timed_iters)):
+        p = clf.predict(crops[i % len(crops)])
+        for k in stages:
+            stages[k].append(p.latency_ms[k])
+    total = np.sum([stages[k] for k in stages], axis=0)
+    out = {k: {"mean": float(np.mean(v)), "p50": float(np.median(v)), "p95": float(np.percentile(v, 95))}
+           for k, v in {**stages, "total": total}.items()}
+    out["device"], out["threads"] = clf.device, torch.get_num_threads()
+    out["params_millions"] = sum(p.numel() for p in clf.model.parameters()) / 1e6
     return out
-    """
 
 
-def reward_curve(probs, y_true, t: int, thresholds) -> list[dict]:
-    """
-    Argmax-plus-threshold reward decision for commanded class t ("sit" or "down"):
-      y_pred = probs.argmax(1)
-      for thr in thresholds:                       # np.arange(start, stop + step/2, step) from eval.threshold_sweep
-          fire = (y_pred == t) & (probs[:, t] >= thr)
-          precision = mean(y_true[fire] == t)            (NaN if nothing fires)
-          recall    = sum(fire & (y_true == t)) / sum(y_true == t)
-          false_reward_rate = sum(fire & (y_true != t)) / sum(y_true != t)
-                                                   # fraction of non-t images that would earn a treat
-          n_fired = sum(fire)
-          rows.append({thr, precision, recall, false_reward_rate, n_fired})
-    return rows
-    """
+# ---------------------------------------------------------------------------
 
+def main() -> None:
+    p = argparse.ArgumentParser(description="K-fold CV, thresholds, final retrain, test evaluation.")
+    add_common_args(p)
+    p.add_argument("--folds", default=None, help="comma-separated fold indices to run (default: all)")
+    p.add_argument("--epochs", type=int, default=None, help="override train.epochs (smoke tests)")
+    p.add_argument("--reuse-folds", action="store_true",
+                   help="load existing checkpoints/fold{k}_best.pt instead of retraining that fold (resume after a crash)")
+    args = p.parse_args()
+    cfg = load_config(args.config, limit=args.limit)
+    log = setup_logging("05_train", cfg.debug.log_level)
+    set_seed(cfg.seed)
+    torch.set_num_threads(int(cfg.train.torch_threads))
+    device = pick_device(cfg.detector.device)
+    epochs = args.epochs or int(cfg.train.epochs)
+    limited = bool(cfg.debug.limit_images)
+    dbg, res_dir = resolve(cfg.debug.debug_dir), resolve(cfg.paths.results_dir)
+    ckpt_dir = resolve(cfg.paths.checkpoints_dir)
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
 
-def choose_threshold(curve, precision_target) -> dict:
-    """
-    Lowest threshold whose precision >= target (lowest = keeps the most recall).
-    Require n_fired >= 30 at that threshold so precision isn't estimated from a handful of images.
-    If no threshold reaches the target: return the threshold with the highest precision, plus
-    reached_target = False. That's a feasibility red flag to report, not a crash.
-    return {"threshold", "precision", "recall", "false_reward_rate", "reached_target"}
-
-    NOTE: these are per-FRAME numbers. The temporal gate (out of scope) should raise effective
-          precision further, so per-frame recall can be traded away somewhat.
-    """
-
-
-def run_fold(fold, train_rows, val_rows, cfg, classes, device) -> dict:
-    """
-    set_seed(cfg.seed + fold)
-    model = build_model(cfg.classifier, num_classes=len(classes)).to(device)
-    loaders, counts = make_loaders(...); criterion = make_criterion(cfg)
-    optimizer = AdamW([{"params": head, "lr": lr_head}, {"params": backbone, "lr": lr_backbone}],
-                      weight_decay=...)
-    scheduler = cosine with warmup
-    best, best_epoch, patience = -inf, -1, 0
-    for epoch in range(train.epochs):
-        set backbone.requires_grad = (epoch >= classifier.freeze_backbone_epochs)
-        tr_loss = train_one_epoch(...)
-        probs, y, _ = predict_all(model, val_loader, device)
-        m = compute_metrics(...); val_loss = criterion(probs/logits, y)
-        append a row to train_log.csv
-        score = m[train.selection_metric]          # macro_f1
-        if score > best: best = score; best_epoch = epoch; save checkpoints/fold{fold}_best.pt; patience = 0
-        else: patience += 1; if patience >= early_stopping_patience: break
-    reload best checkpoint, recompute val probs + metrics, save confusion_fold{fold}.png
-    return {"fold": fold, "best_epoch": best_epoch, "val_metrics": m, "val_probs": probs, "val_y": y,
-            "n_train", "n_val", "class_counts"}
-    """
-
-
-def cross_validate(trainval_rows, cfg, classes, device) -> list[dict]:
-    """
-    skf = StratifiedKFold(n_splits=train.k_folds, shuffle=True, random_state=cfg.seed)
-    for fold, (tr_idx, va_idx) in enumerate(skf.split(rows, labels)):
-        if --folds given and fold not in it: continue
-        assert set(tr ids).isdisjoint(va ids)
-        assert no row has split == "test"               # the test set NEVER enters CV
-        results.append(run_fold(...))
-    Summarize: mean +/- std across folds of each per-class precision/recall/F1 and sit<->down confusion.
-    Reward thresholds (the key output of CV):
-        oof_probs = concat(r["val_probs"] for r in results); oof_y = concat(r["val_y"])
-        assert len(oof_y) == len(trainval_rows)           # every trainval image predicted exactly once
-        for t in target_classes:
-            curve = reward_curve(oof_probs, oof_y, classes.index(t), sweep)
-            thresholds[t] = choose_threshold(curve, eval.reward_precision_target)
-        save results/pr_vs_threshold_cv.csv
-    Pooled out-of-fold predictions give a threshold choice that never touches test.
-    return results, thresholds
-    """
-
-
-def train_final_model(trainval_rows, cfg, classes, device, cv_results) -> "nn.Module":
-    """
-    Retrain from the pretrained backbone on ALL trainval rows:
-        epochs = round(mean(best_epoch over folds)) + 1     # best_epoch is 0-indexed
-        same optimizer/scheduler/freeze schedule as run_fold, with scheduler length = epochs
-        no validation, no early stopping
-    return model
-    NOTE: the CV thresholds were fit on fold models, not this one. Retraining on ~25% more data
-          shifts probabilities slightly; test results at those thresholds tell us if that matters.
-    """
-
-
-def final_eval(model, test_rows, cfg, classes, thresholds_from_cv, device) -> dict:
-    """
-    THE ONLY PLACE test rows are loaded.
-    probs, y, ids = predict_all(model, test_loader, device)
-    m = compute_metrics(...)
-    for t in target_classes:
-        curve = reward_curve(probs, y, t, sweep)                     # full curve, for the writeup
-        m["reward"][t] = row of curve at thresholds_from_cv[t]       # NOT re-tuned on test
-    save confusion_test.png, pr_vs_threshold_test.csv,
-         results/test_errors.csv (image_id, true, pred, prob) for the misclassification grid
-    return m
-    """
-
-
-def measure_latency(model, cfg, device) -> dict:
-    """
-    Per-stage inference latency from CROP to PREDICTION, batch size 1 (as in the live loop):
-      for dev in eval.latency_devices (+ cuda/mps if available):
-        clf = PostureClassifier(model, transform, classes, device=dev)
-        take ~50 real test crops as PIL images
-        warmup eval.latency_warmup_iters
-        for eval.latency_timed_iters:
-            t0 = perf_counter()
-            x = transform(img)              # stage: preprocess (resize/normalize)
-            t1 = perf_counter()
-            logits = model(x[None].to(dev)); sync if cuda   # stage: forward
-            t2 = perf_counter()
-            probs = softmax(logits).cpu()   # stage: postprocess
-            t3 = perf_counter()
-        report mean / p50 / p95 per stage + total, in ms. Also param count and checkpoint MB.
-    The detector's latency comes from 04's detection_report.json. Combine both in metrics.json
-    under "latency" for a first frame->prediction estimate (minus network/MJPEG decode).
-    """
-
-
-def build_metrics_json(cfg, classes, cv_results, test_metrics, latency, extra) -> dict:
-    """
-    {
-      "config": full config snapshot, "classes": classes, "seed": seed,
-      "data": {"n_trainval", "n_test", "class_counts",
-               "duplicates_dropped": from 03, "crop_drops": from detection_report.json},
-      "cv": {"folds": [...], "mean": {...}, "std": {...}, "reward_thresholds": {...}},
-      "test": test_metrics,
-      "latency": {"classifier": latency, "detector": from detection_report.json},
-      "checkpoint": "checkpoints/final.pt",
-      "timestamp", "torch_version", "timm_version", "device"
-    }
-    """
-
-
-def sanity_checks(cv_results, test_metrics, classes, cfg) -> None:
-    """
-    assert len(cv_results) == k_folds (unless --folds subset given)
-    assert every fold's val confusion matrix sums to n_val; test cm sums to n_test
-    assert test metrics computed on rows with split == "test" only, all of whose ids are in data/test_ids.txt
-    assert final.pt stores the CV thresholds, and should_reward() matches reward_curve's `fire` on test
-    assert final.pt reloads via PostureClassifier.load() and reproduces test probs on 5 images
-           (atol 1e-5): catches transform/class-order mismatches between training and runtime
-    assert classes in checkpoint == classes.json
-    warn if test macro F1 is far below CV mean (> 0.05): possible leakage or drift
-    warn if any fold's metric is far from the others: unstable or bad split
-    feasibility bar (warn, don't fail): sit and down test precision >= eval.reward_precision_target
-        at the CV thresholds, and sit_as_down, down_as_sit < eval.max_sit_down_confusion.
-        If not, flag it in the report.
-    """
-
-
-def main():
-    """
-    args, cfg = ...; set_seed(cfg.seed); torch.backends.cudnn.deterministic = True;
-    torch.backends.cudnn.benchmark = False; device = pick_device(cfg)
-    classes = json.load("data/classes.json")["classes"]
+    # ---- data --------------------------------------------------------------
+    header("1. Data")
+    import json
+    with open(resolve(cfg.paths.classes_json)) as f:
+        cj = json.load(f)
+    classes, targets = cj["classes"], cj["target_classes"]
     rows = read_csv(cfg.paths.crops_manifest)
-    trainval = [r for r in rows if r["split"] == "trainval"]; test = [... == "test"]
-    cv, thresholds = cross_validate(trainval, cfg, classes, device)
-    model = train_final_model(trainval, cfg, classes, device, cv)
-    save checkpoints/final.pt (via PostureClassifier.save, including thresholds)
-    test_m = final_eval(model, test, cfg, classes, thresholds, device)
-    lat = measure_latency(model, cfg, device)
-    json.dump(build_metrics_json(...), open(cfg.paths.metrics_json, "w"), indent=2)
-    print a short summary table (per-class P/R/F1 test, reward precision, latency p50)
-    sanity_checks(...)
-    debug grid: results/debug/05_test_errors.jpg (worst 32 confident mistakes, captioned
-        "true -> pred (prob)"), results/debug/05_train_aug_samples.jpg (augmented train batch)
-    """
+    if limited:
+        rows = random.Random(cfg.seed).sample(rows, min(cfg.debug.limit_images, len(rows)))
+    rows.sort(key=lambda r: r["image_id"])
+    for r in rows:
+        assert classes[int(r["label_id"])] == r["label"], f"label_id/classes.json mismatch for {r['image_id']}"
+    trainval = [r for r in rows if r["split"] == "trainval"]
+    test = [r for r in rows if r["split"] == "test"]
+    test_ids_file = set(resolve(cfg.paths.test_ids).read_text().split())
+    assert {r["image_id"] for r in test} <= test_ids_file, "a test crop is not in data/test_ids.txt"
+    assert not ({r["image_id"] for r in trainval} & test_ids_file), "a trainval crop is in the test set"
+    tvc, tec = Counter(r["label"] for r in trainval), Counter(r["label"] for r in test)
+    print_table([(c, tvc[c], tec[c]) for c in classes], ["class", "trainval", "test"])
+    log.info("device %s, %d torch threads, input %dpx, backbone %s, %d epochs max",
+             device, torch.get_num_threads(), int(cfg.classifier.input_size), cfg.classifier.backbone, epochs)
+
+    labels = np.array([int(r["label_id"]) for r in trainval])
+    data = {"labels": labels, "paths": [r["crop_path"] for r in trainval],
+            "cache": load_cache(trainval, int(cfg.train.cache_size)) if cfg.train.cache_images else None}
+
+    if cfg.debug.save_debug_grid:
+        tf = build_train_transform(cfg.augment, int(cfg.classifier.input_size), cfg.classifier.normalize_mean,
+                                   cfg.classifier.normalize_std)
+        ds = CropDataset(range(len(trainval)), labels, tf, data["cache"], data["paths"])
+        items = []
+        for i in random.Random(cfg.seed).sample(range(len(ds)), min(32, len(ds))):
+            x, y = ds[i]
+            items.append((denormalize(x, cfg.classifier.normalize_mean, cfg.classifier.normalize_std),
+                          f"{classes[y]}\n{trainval[i]['image_id']}"))
+        log.info("wrote %s", rel(save_contact_sheet(items, dbg / "05_train_aug_samples.jpg", cols=8,
+                                                    title="Augmented training inputs, exactly as the model sees them")))
+
+    # ---- cross-validation --------------------------------------------------
+    header("2. Stratified K-fold cross-validation")
+    k = int(cfg.train.k_folds)
+    folds = [int(f) for f in args.folds.split(",")] if args.folds else list(range(k))
+    skf = StratifiedKFold(n_splits=k, shuffle=True, random_state=cfg.seed)
+    oof = np.full((len(trainval), len(classes)), np.nan, dtype=np.float32)
+    log_rows, cv = [], []
+    if args.reuse_folds and (res_dir / "train_log.csv").exists():
+        num = lambda v: None if v in ("", "None") else (v == "True" if v in ("True", "False") else float(v))
+        log_rows = [{k: (v if k == "fold" else num(v)) for k, v in r.items()}
+                    for r in read_csv(res_dir / "train_log.csv") if r["fold"].isdigit()]
+    t_cv = time.perf_counter()
+    for fold, (tr, va) in enumerate(skf.split(np.zeros(len(labels)), labels)):
+        if fold not in folds:
+            continue
+        assert set(tr).isdisjoint(va)
+        log.info("fold %d/%d: %d train, %d val", fold, k, len(tr), len(va))
+        ckpt_path = ckpt_dir / f"fold{fold}_best.pt"
+        if args.reuse_folds and ckpt_path.exists():
+            prev = PostureClassifier.load(ckpt_path, device)
+            assert prev.classes == classes, f"{ckpt_path} has classes {prev.classes}"
+            vl = DataLoader(CropDataset(va, labels, build_eval_transform(int(cfg.classifier.input_size),
+                            cfg.classifier.normalize_mean, cfg.classifier.normalize_std), data["cache"], data["paths"]),
+                            batch_size=128, shuffle=False, num_workers=int(cfg.train.num_workers))
+            logits, yv = predict_logits(prev.model, vl, device)
+            out = {"model": prev.model, "best_epoch": int(prev.extra["best_epoch"]),
+                   "val_probs": torch.softmax(logits, 1).numpy(), "val_y": yv.numpy()}
+            log.info("fold %d: reused %s (best epoch %d)", fold, rel(ckpt_path), out["best_epoch"])
+        else:
+            out = train_model(cfg, classes, data, tr, va, device, epochs, str(fold), log_rows, log)
+        assert (out["val_y"] == labels[va]).all(), "val order changed"
+        oof[va] = out["val_probs"]
+        m = classification_metrics(out["val_probs"], out["val_y"], classes)
+        make_classifier(out["model"], cfg, classes, device=device).save(ckpt_dir / f"fold{fold}_best.pt",
+                                                                          {"fold": fold, "best_epoch": out["best_epoch"]})
+        plot_confusion(m["confusion_matrix"], classes, dbg / f"05_confusion_fold{fold}.png",
+                       f"Fold {fold} validation (best epoch {out['best_epoch']})")
+        plot_training_curves(log_rows, dbg / "05_training_curves.png", "Cross-validation training curves")
+        cv.append({"fold": fold, "best_epoch": out["best_epoch"], "n_train": len(tr), "n_val": len(va), "metrics": m})
+        log.info("fold %d done: best epoch %d, macro F1 %.4f (%.0f min elapsed)", fold, out["best_epoch"],
+                 m["macro_f1"], (time.perf_counter() - t_cv) / 60)
+
+    header("3. CV summary")
+    def ms(vals):
+        return f"{np.mean(vals):.3f} ± {np.std(vals):.3f}"
+    table = []
+    for c in classes:
+        table.append([c] + [ms([f["metrics"]["per_class"][c][x] for f in cv]) for x in ("precision", "recall", "f1")])
+    print_table(table, ["class", "precision", "recall", "f1"])
+    print(f"\n  macro F1 {ms([f['metrics']['macro_f1'] for f in cv])}   accuracy {ms([f['metrics']['accuracy'] for f in cv])}"
+          f"   sit->down {ms([f['metrics']['sit_as_down'] for f in cv])}   down->sit {ms([f['metrics']['down_as_sit'] for f in cv])}")
+    print(f"  best epochs per fold: {[f['best_epoch'] for f in cv]}")
+
+    header("4. Reward thresholds from pooled out-of-fold predictions")
+    have = ~np.isnan(oof).any(1)
+    oof_p, oof_y = oof[have], labels[have]
+    if len(folds) == k:
+        assert have.all(), "not every trainval image got an out-of-fold prediction"
+    grid = threshold_grid(cfg.eval.threshold_sweep)
+    target = float(cfg.eval.reward_precision_target)
+    min_fired = int(cfg.eval.min_fired) if not limited else 3
+    cv_curves, thresholds, chosen = {}, {}, {}
+    for t in targets:
+        cv_curves[t] = reward_curve(oof_p, oof_y, classes.index(t), grid)
+        chosen[t] = choose_threshold(cv_curves[t], target, min_fired)
+        thresholds[t] = chosen[t]["threshold"]
+    print_table([(t, chosen[t]["threshold"], chosen[t]["precision"], chosen[t]["recall"],
+                  chosen[t]["false_reward_rate"], "yes" if chosen[t]["reached_target"] else "NO") for t in targets],
+                ["commanded", "threshold", "precision", "recall", "false reward rate", f"reached {target}"])
+    write_csv([{"class": t, **r} for t in targets for r in cv_curves[t]], res_dir / "pr_vs_threshold_cv.csv", CURVE_FIELDS)
+    plot_reward_curves(cv_curves, chosen, dbg / "05_reward_curves_cv.png",
+                       "Reward precision/recall vs. threshold (pooled out-of-fold, trainval)", target)
+    for t in targets:
+        if not chosen[t]["reached_target"]:
+            log.warning("'%s' never reaches %.2f precision on CV; using its most precise threshold %.2f",
+                        t, target, thresholds[t])
+
+    # ---- final model -------------------------------------------------------
+    header("5. Final model: retrain on all trainval")
+    final_epochs = int(round(np.mean([f["best_epoch"] for f in cv]))) + 1
+    log.info("retraining for %d epochs (mean best epoch %.2f + 1) on %d images",
+             final_epochs, np.mean([f["best_epoch"] for f in cv]), len(trainval))
+    final = train_model(cfg, classes, data, np.arange(len(trainval)), None, device, final_epochs, "final", log_rows, log)
+    final_path = make_classifier(final["model"], cfg, classes, thresholds, device).save(
+        ckpt_dir / "final.pt", {"final_epochs": final_epochs, "config": cfg.to_dict(), "cv_thresholds": chosen})
+    log.info("saved %s (%.1f MB)", rel(final_path), final_path.stat().st_size / 1e6)
+    data["cache"] = None  # free ~1 GB before test evaluation
+
+    # ---- test --------------------------------------------------------------
+    header("6. Held-out test evaluation (runtime path: PostureClassifier.load -> native crops)")
+    clf = PostureClassifier.load(final_path, device)
+    assert clf.classes == classes and clf.reward_thresholds == thresholds
+    test_imgs = []
+    for r in tqdm(test, desc="load test crops", unit="img"):
+        with Image.open(resolve(r["crop_path"])) as im:
+            test_imgs.append(im.convert("RGB"))
+    y_test = np.array([int(r["label_id"]) for r in test])
+    probs = clf.predict_probs(test_imgs)
+    tm = classification_metrics(probs, y_test, classes)
+    print_table([(c, tm["per_class"][c]["precision"], tm["per_class"][c]["recall"], tm["per_class"][c]["f1"],
+                  tm["per_class"][c]["support"]) for c in classes], ["class", "precision", "recall", "f1", "support"])
+    print(f"\n  macro F1 {tm['macro_f1']:.4f}   accuracy {tm['accuracy']:.4f}   "
+          f"sit->down {tm['sit_as_down']:.3f}   down->sit {tm['down_as_sit']:.3f}")
+    test_curves, test_reward = {}, {}
+    for t in targets:
+        test_curves[t] = reward_curve(probs, y_test, classes.index(t), grid)
+        test_reward[t] = row_at(test_curves[t], thresholds[t])
+    print()
+    print_table([(t, thresholds[t], test_reward[t]["precision"], test_reward[t]["recall"],
+                  test_reward[t]["false_reward_rate"], test_reward[t]["n_fired"]) for t in targets],
+                ["commanded", "CV threshold", "test precision", "test recall", "false reward rate", "rewards"])
+    tm["reward_at_cv_threshold"] = test_reward
+    write_csv([{"class": t, **r} for t in targets for r in test_curves[t]], res_dir / "pr_vs_threshold_test.csv",
+              CURVE_FIELDS)
+    plot_confusion(tm["confusion_matrix"], classes, dbg / "05_confusion_test.png", "Held-out test set")
+    plot_reward_curves(test_curves, {t: test_reward[t] for t in targets}, dbg / "05_reward_curves_test.png",
+                       "Test reward precision/recall (dashed line = threshold chosen on CV)", target)
+    pred = probs.argmax(1)
+    pred_rows = [{"image_id": r["image_id"], "crop_path": r["crop_path"], "true": r["label"], "pred": classes[pred[i]],
+                  **{f"p_{c}": round(float(probs[i, j]), 4) for j, c in enumerate(classes)}} for i, r in enumerate(test)]
+    write_csv(pred_rows, res_dir / "test_predictions.csv",
+              ["image_id", "crop_path", "true", "pred"] + [f"p_{c}" for c in classes])
+
+    if cfg.debug.save_debug_grid:
+        wrong = np.nonzero(pred != y_test)[0]
+        wrong = wrong[np.argsort(-probs[wrong, pred[wrong]])][:32]
+        if len(wrong):
+            save_contact_sheet([(test_imgs[i], f"true {classes[y_test[i]]}\npred {classes[pred[i]]} "
+                                               f"{probs[i, pred[i]]:.2f}\n{test[i]['image_id']}") for i in wrong],
+                               dbg / "05_test_confident_mistakes.jpg", cols=8,
+                               title="Most confident test mistakes (dataset label, model prediction + probability)")
+        fr = []
+        for t in targets:
+            ti = classes.index(t)
+            fire = (pred == ti) & (probs[:, ti] >= thresholds[t]) & (y_test != ti)
+            fr += [(test_imgs[i], f"cmd {t}: REWARDED\nlabel {classes[y_test[i]]}, model {t} {probs[i, ti]:.2f}\n{test[i]['image_id']}")
+                   for i in np.nonzero(fire)[0]]
+        if fr:
+            save_contact_sheet(fr[:48], dbg / "05_test_false_rewards.jpg", cols=8,
+                               title=f"Test images that would WRONGLY earn a treat at the CV thresholds ({len(fr)} total)")
+
+    # ---- latency -----------------------------------------------------------
+    header("7. Latency: crop -> prediction, batch 1")
+    lat = measure_latency(clf, test_imgs[:50], cfg)
+    print_table([(s, lat[s]["mean"], lat[s]["p50"], lat[s]["p95"]) for s in ("pre", "fwd", "post", "total")],
+                ["stage (ms)", "mean", "p50", "p95"])
+    det_report_path = res_dir / "detection_report.json"
+    det_report = json.loads(det_report_path.read_text()) if det_report_path.exists() else {}
+    det_ms = det_report.get("latency_ms_per_image", {})
+    yolo_ms = sum(det_ms.get(f"yolo_{k}", 0) for k in ("preprocess", "inference", "postprocess"))
+    print(f"\n  detector (from 04, batched): ~{yolo_ms:.1f} ms/image  ->  frame-to-prediction estimate "
+          f"~{yolo_ms + lat['total']['mean']:.0f} ms on this CPU (excluding MJPEG decode and network)")
+
+    # ---- metrics.json ------------------------------------------------------
+    metrics = {
+        "classes": classes, "target_classes": targets, "seed": cfg.seed,
+        "data": {"n_trainval": len(trainval), "n_test": len(test), "trainval_counts": dict(tvc),
+                 "test_counts": dict(tec), "detector_drop_rate": det_report.get("drop_rate"), "limited": limited},
+        "cv": {"k": k, "folds_run": folds, "folds": cv,
+               "mean": {"macro_f1": float(np.mean([f["metrics"]["macro_f1"] for f in cv])),
+                        "accuracy": float(np.mean([f["metrics"]["accuracy"] for f in cv]))},
+               "std": {"macro_f1": float(np.std([f["metrics"]["macro_f1"] for f in cv]))},
+               "reward_thresholds": chosen},
+        "final": {"epochs": final_epochs, "checkpoint": rel(final_path)},
+        "test": tm,
+        "latency": {"classifier_batch1_ms": lat, "detector_ms": det_ms},
+        "config": cfg.to_dict(),
+        "versions": {"torch": torch.__version__, "timm": __import__("timm").__version__},
+    }
+    save_json(metrics, cfg.paths.metrics_json)
+    log.info("wrote %s", cfg.paths.metrics_json)
+
+    # ---- sanity ------------------------------------------------------------
+    header("8. Sanity checks")
+    for f in cv:
+        assert np.sum(f["metrics"]["confusion_matrix"]) == f["n_val"]
+    assert np.sum(tm["confusion_matrix"]) == len(test)
+    print("  [ok] every confusion matrix sums to its split size")
+    clf2 = PostureClassifier.load(final_path, "cpu")
+    p2 = clf2.predict_probs(test_imgs[:8])
+    assert np.allclose(p2, probs[:8], atol=1e-4), "reloaded checkpoint does not reproduce test probabilities"
+    print("  [ok] final.pt reloads and reproduces test probabilities")
+    for t in targets:
+        ti = classes.index(t)
+        fire = (pred == ti) & (probs[:, ti] >= thresholds[t])
+        rewards = [clf.should_reward(clf._to_prediction(pp), t) for pp in probs]
+        assert np.array_equal(fire, np.array(rewards)), f"should_reward disagrees with the metric for {t}"
+    print("  [ok] PostureClassifier.should_reward matches the reward metric exactly")
+    cv_f1 = metrics["cv"]["mean"]["macro_f1"]
+    if tm["macro_f1"] < cv_f1 - 0.05:
+        log.warning("test macro F1 %.3f is well below CV %.3f: leakage or drift?", tm["macro_f1"], cv_f1)
+    else:
+        print(f"  [ok] test macro F1 {tm['macro_f1']:.3f} is consistent with CV {cv_f1:.3f}")
+    bar_ok = all(test_reward[t]["precision"] >= target for t in targets) and \
+        tm["sit_as_down"] < float(cfg.eval.max_sit_down_confusion) and tm["down_as_sit"] < float(cfg.eval.max_sit_down_confusion)
+    print(f"\n  FEASIBILITY BAR (test precision >= {target} for {targets} at CV thresholds, sit<->down "
+          f"< {cfg.eval.max_sit_down_confusion}): {'PASSED' if bar_ok else 'NOT MET'}")
+    print("\n  Done. Try the full pipeline: python scripts/06_run_pipeline.py --source data/split_manifest.csv --split test")
 
 
-# if __name__ == "__main__":
-#     main()
+if __name__ == "__main__":
+    main()
 
-
-# ---------------------------------------------------------------------------
 # DEBUGGING GUIDE
-# ---------------------------------------------------------------------------
-# Intermediates:
-#   results/train_log.csv          Loss/metrics per epoch per fold. Plot train vs val loss for over/underfitting.
-#   checkpoints/fold{k}_best.pt    Per-fold best weights (by selection_metric).
-#   checkpoints/final.pt           Model + classes + transforms config. Load with PostureClassifier.load().
-#   results/confusion_*.png        Look at the sit<->down cells first. That's the feasibility question.
-#   results/pr_vs_threshold_cv.csv     How much recall you give up to reach the precision target.
-#                                      The chosen threshold per class is the first row with precision >= 0.85.
-#   results/pr_vs_threshold_test.csv   Same on test. If test precision at the CV threshold is well below
-#                                      0.85, the threshold didn't transfer (see train_final_model NOTE).
-#   results/test_errors.csv + results/debug/05_test_errors.jpg   Which images fool the model.
-#   results/debug/05_train_aug_samples.jpg   Make sure augmentations look like plausible room frames,
-#                                            not destroyed images.
-#   results/metrics.json           Everything for the writeup.
-#
-# Workflow:
-#   1. Smoke test: --limit 200 --folds 0 with epochs 1. Should finish in minutes on CPU and produce
-#      every output file. Then run the full thing.
-#   2. If val accuracy is stuck near the majority-class rate (~50% = "down"), the backbone is frozen
-#      too long, the LR is wrong, or labels are shuffled. Check 05_train_aug_samples.jpg captions.
-#   3. If train loss -> 0 and val loss climbs: overfitting. More aug, fewer epochs, or a smaller model.
-#   4. If test << CV: suspect near-duplicate leakage within trainval folds (inflated CV) or a split bug.
-#   5. Confident mistakes on "sit" that are actually ambiguous/mislabeled images are worth counting.
-#      DogPoseCV labels are not perfect, which caps achievable precision.
+#   results/train_log.csv / 05_training_curves.png  live during training. Val loss rising while train
+#       loss falls = overfitting; macro F1 stuck near 0.33 = labels or LR broken.
+#   05_train_aug_samples.jpg   augmentations should look like plausible room frames, not destroyed images.
+#   05_confusion_*.png         read the sit/down cells first: that's the feasibility question.
+#   05_reward_curves_*.png     how much recall it costs to reach the precision target.
+#   05_test_false_rewards.jpg  every test image that would wrongly get a treat. Mislabeled ones cap precision.
+#   checkpoints/final.pt       load with trickforTreat.classifier.PostureClassifier.load(path).
